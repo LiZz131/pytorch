@@ -1125,6 +1125,24 @@ static void registerCudaDeviceProperties(PyObject* module) {
   m.def("_cudnn_set_conv_benchmark_empty_cache", [](bool enable) {
     return at::native::_cudnn_set_conv_benchmark_empty_cache(enable);
   });
+
+  // Stream Mutex Group: allow free-block reuse across mutually exclusive
+  // streams to eliminate N× memory growth in pdmux scenarios.
+  m.def(
+      "_cuda_registerStreamMutexGroup",
+      [](std::vector<int64_t> raw_streams, std::string key) {
+        std::vector<cudaStream_t> streams;
+        streams.reserve(raw_streams.size());
+        for (auto s : raw_streams)
+          streams.push_back(reinterpret_cast<cudaStream_t>(s));
+        c10::cuda::CUDACachingAllocator::registerStreamMutexGroup(streams, key);
+      });
+  m.def("_cuda_unregisterStreamMutexGroup", [](std::string key) {
+    c10::cuda::CUDACachingAllocator::unregisterStreamMutexGroup(key);
+  });
+  m.def("_cuda_streamMutexGroupReuseCount", []() {
+    return c10::cuda::CUDACachingAllocator::streamMutexGroupReuseCount();
+  });
 }
 
 // We choose to ignore certain blocks that are currently allocated

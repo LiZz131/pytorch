@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace c10 {
 
@@ -520,6 +521,36 @@ inline void enablePeerAccess(
     c10::DeviceIndex dev_to_access) {
   return get()->enablePeerAccess(dev, dev_to_access);
 }
+
+// ---------------------------------------------------------------------------
+// Stream Mutex Group API
+//
+// Streams in the same mutex group are guaranteed to be mutually exclusive at
+// runtime (they never execute concurrently). Registering such groups tells the
+// caching allocator that it is safe to reuse free blocks across group members,
+// eliminating the N× memory growth that would otherwise occur when N distinct
+// streams each need independent allocations of the same data.
+//
+// Example (pdmux decode streams):
+//   std::vector<cudaStream_t> decode_streams = {s0, s1, s2, s3};
+//   c10::cuda::CUDACachingAllocator::registerStreamMutexGroup(
+//       decode_streams, "decode");
+//   // ... run workload ...
+//   c10::cuda::CUDACachingAllocator::unregisterStreamMutexGroup("decode");
+//
+// Thread safety: register/unregister may be called from any thread. The hot
+// allocation path (get_free_block) acquires a shared read-lock and has
+// negligible overhead when no groups are registered (one atomic load).
+// ---------------------------------------------------------------------------
+C10_CUDA_API void registerStreamMutexGroup(
+    const std::vector<cudaStream_t>& streams,
+    const std::string& key);
+
+C10_CUDA_API void unregisterStreamMutexGroup(const std::string& key);
+
+// Returns the total number of cross-stream block reuses since process start.
+// Useful for testing and diagnostics.
+C10_CUDA_API int64_t streamMutexGroupReuseCount();
 
 } // namespace c10::cuda::CUDACachingAllocator
 

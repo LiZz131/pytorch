@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 #include <regex>
 #include <set>
 #include <stack>
@@ -1136,6 +1137,33 @@ static std::string reportProcessMemoryInfo(c10::DeviceIndex device) {
   return "";
 #endif
 }
+
+// -----------------------------------------------------------------
+// Stream Mutex Group global state.
+// Defined here (outside namespace Native) so both DeviceCachingAllocator
+// and the public API functions below can access it.
+// -----------------------------------------------------------------
+namespace {
+
+struct StreamMutexGroupRegistry {
+  mutable std::shared_mutex mu;
+  // stream → group id
+  std::unordered_map<cudaStream_t, int> stream_to_gid;
+  // group id → ordered list of all streams in group
+  std::unordered_map<int, std::vector<cudaStream_t>> gid_to_streams;
+  // registration key → group id (for unregister)
+  std::unordered_map<std::string, int> key_to_gid;
+  int next_gid_{0};
+};
+
+static StreamMutexGroupRegistry g_smg_registry;
+// Fast early-exit: one atomic load ≈ 1 cycle when no groups registered.
+static std::atomic<bool> g_has_smg{false};
+// Diagnostic: total cross-stream block reuses via mutex groups.
+static std::atomic<int64_t> g_smg_reuse_count{0};
+
+} // anonymous namespace
+// -----------------------------------------------------------------
 
 namespace Native {
 
@@ -2963,55 +2991,92 @@ class DeviceCachingAllocator {
       // Track block reuse interval only when garbage collection is enabled.
       ++pool.get_free_blocks_call_count;
     }
-    auto it = pool.blocks.lower_bound(&p.search_key);
-    if (it == pool.blocks.end() || (*it)->stream != p.stream())
+
+    // Helper: find the best free block for a given stream.
+    // Encapsulates expandable-segment best-fit and size-limit checks.
+    // Returns pool.blocks.end() when no suitable block is found.
+    auto find_for_stream =
+        [&](cudaStream_t stream) -> std::set<Block*, Comparison>::iterator {
+      Block key(p.device(), stream, p.size());
+      auto it = pool.blocks.lower_bound(&key);
+      if (it == pool.blocks.end() || (*it)->stream != stream)
+        return pool.blocks.end();
+
+      if ((*it)->expandable_segment_) {
+        if (CUDAAllocatorConfig::expandable_segments()) {
+          // For expandable segments, "best fit" uses the size the block can
+          // expand to, not its current size. Scan forward for a better fit.
+          auto expandable_size = [](Block* b) {
+            return b->size + (b->next && !b->next->mapped ? b->next->size : 0);
+          };
+          auto next = it;
+          ++next;
+          while ((*it)->expandable_segment_ && next != pool.blocks.end() &&
+                 (*next)->stream == stream &&
+                 expandable_size(*next) < expandable_size(*it)) {
+            it = next++;
+          }
+        } else {
+          // expandable_segments disabled after some blocks were already created
+          // as expandable — skip them and look for a non-expandable block.
+          do {
+            ++it;
+          } while (it != pool.blocks.end() && (*it)->expandable_segment_ &&
+                   (*it)->stream == stream);
+          if (it == pool.blocks.end() || (*it)->stream != stream)
+            return pool.blocks.end();
+        }
+      }
+
+      // Do not return an oversized block for a large request.
+      if ((p.size() < CUDAAllocatorConfig::max_split_size()) &&
+          ((*it)->size >= CUDAAllocatorConfig::max_split_size()))
+        return pool.blocks.end();
+      // Allow oversized block size to be rounded up but within a limit.
+      if ((p.size() >= CUDAAllocatorConfig::max_split_size()) &&
+          ((*it)->size >=
+           p.size() + CUDAAllocatorConfig::max_non_split_rounding_size()))
+        return pool.blocks.end();
+
+      return it;
+    };
+
+    // Normal path: exact stream match.
+    auto it = find_for_stream(p.stream());
+    if (it != pool.blocks.end()) {
+      p.block = *it;
+      pool.blocks.erase(it);
+      return true;
+    }
+
+    // Stream mutex group fallback.
+    // Only entered when at least one group is registered (atomic fast-exit).
+    if (!g_has_smg.load(std::memory_order_acquire))
       return false;
 
-    if ((*it)->expandable_segment_) {
-      if (CUDAAllocatorConfig::expandable_segments()) {
-        // if we are allocated to the part of the block that is expandable
-        // for the purposes of "best fit" we consider its size to be the size it
-        // can expand to, not the size it currently is. This means that we
-        // sometimes have to search for blocks with bigger 'size' before
-        // choosing this segment.
-        auto expandable_size = [](Block* b) {
-          return b->size + (b->next && !b->next->mapped ? b->next->size : 0);
-        };
-        auto next = it;
-        next++;
-        while ((*it)->expandable_segment_ && next != pool.blocks.end() &&
-               (*next)->stream == p.stream() &&
-               expandable_size(*next) < expandable_size(*it)) {
-          it = next++;
-        }
-      } else {
-        // Rarely expandable segments has been turned off after we have
-        // already allocated some blocks as expandable. For instance,
-        // since we cannot share expandable memory via IPC, someone might
-        // temporarily disable it. In this case we need to honor this request
-        // by only finding non-expandable blocks
-        do {
-          it++;
-        } while (it != pool.blocks.end() && (*it)->expandable_segment_ &&
-                 (*it)->stream == p.stream());
-        if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
-          return false;
+    {
+      std::shared_lock<std::shared_mutex> reg_lock(g_smg_registry.mu);
+      auto gid_it = g_smg_registry.stream_to_gid.find(p.stream());
+      if (gid_it != g_smg_registry.stream_to_gid.end()) {
+        for (cudaStream_t alt :
+             g_smg_registry.gid_to_streams.at(gid_it->second)) {
+          if (alt == p.stream())
+            continue;
+          auto alt_it = find_for_stream(alt);
+          // Skip expandable blocks from peer streams (conservative).
+          if (alt_it == pool.blocks.end() || (*alt_it)->expandable_segment_)
+            continue;
+          p.block = *alt_it;
+          pool.blocks.erase(alt_it);
+          // Re-key: this block (and any split remainder) now belongs to
+          // p.stream()'s bucket so it returns there on free.
+          p.block->stream = p.stream();
+          g_smg_reuse_count.fetch_add(1, std::memory_order_relaxed);
+          return true;
         }
       }
     }
-
-    // Do not return an oversized block for a large request
-    if ((p.size() < CUDAAllocatorConfig::max_split_size()) &&
-        ((*it)->size >= CUDAAllocatorConfig::max_split_size()))
-      return false;
-    // Allow oversized block size to be rounded up but within a limit
-    if ((p.size() >= CUDAAllocatorConfig::max_split_size()) &&
-        ((*it)->size >=
-         p.size() + CUDAAllocatorConfig::max_non_split_rounding_size()))
-      return false;
-    p.block = *it;
-    pool.blocks.erase(it);
-    return true;
+    return false;
   }
 
   bool trigger_free_memory_callbacks(AllocParams& p) {
@@ -4363,6 +4428,64 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+// ============================================================
+// Stream Mutex Group Registry
+//
+// Streams in the same mutex group are guaranteed to be mutually
+// exclusive at runtime (never execute concurrently). Registering
+// such groups allows the allocator to reuse free blocks across
+// group members, eliminating the N× memory growth that occurs
+// when N identical streams each hold their own independent copy.
+//
+// Typical use: pdmux decode streams, pdmux prefill streams.
+// ============================================================
+void registerStreamMutexGroup(
+    const std::vector<cudaStream_t>& streams,
+    const std::string& key) {
+  {
+    std::unique_lock<std::shared_mutex> lock(g_smg_registry.mu);
+    // Re-registration: clean up the old group first.
+    auto key_it = g_smg_registry.key_to_gid.find(key);
+    if (key_it != g_smg_registry.key_to_gid.end()) {
+      int old_gid = key_it->second;
+      for (auto s : g_smg_registry.gid_to_streams[old_gid])
+        g_smg_registry.stream_to_gid.erase(s);
+      g_smg_registry.gid_to_streams.erase(old_gid);
+      g_smg_registry.key_to_gid.erase(key_it);
+    }
+    int gid = g_smg_registry.next_gid_++;
+    g_smg_registry.key_to_gid[key] = gid;
+    g_smg_registry.gid_to_streams[gid] =
+        std::vector<cudaStream_t>(streams.begin(), streams.end());
+    for (auto s : streams)
+      g_smg_registry.stream_to_gid[s] = gid;
+    g_has_smg.store(true, std::memory_order_release);
+  }
+  LOG(INFO) << "[StreamMutexGroup] Registered group '" << key << "' with "
+            << streams.size() << " streams.";
+}
+
+void unregisterStreamMutexGroup(const std::string& key) {
+  {
+    std::unique_lock<std::shared_mutex> lock(g_smg_registry.mu);
+    auto key_it = g_smg_registry.key_to_gid.find(key);
+    if (key_it == g_smg_registry.key_to_gid.end())
+      return;
+    int gid = key_it->second;
+    for (auto s : g_smg_registry.gid_to_streams[gid])
+      g_smg_registry.stream_to_gid.erase(s);
+    g_smg_registry.gid_to_streams.erase(gid);
+    g_smg_registry.key_to_gid.erase(key_it);
+    if (g_smg_registry.stream_to_gid.empty())
+      g_has_smg.store(false, std::memory_order_release);
+  }
+  LOG(INFO) << "[StreamMutexGroup] Unregistered group '" << key << "'.";
+}
+
+int64_t streamMutexGroupReuseCount() {
+  return g_smg_reuse_count.load(std::memory_order_relaxed);
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.
