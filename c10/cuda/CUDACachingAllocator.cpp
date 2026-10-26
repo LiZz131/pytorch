@@ -992,7 +992,211 @@ struct MempoolIdHash {
   }
 };
 
+// Virtual-address arena for tensor_memory_opt. While va_only is set, segment
+// allocations reserve a CUDA VMM address and do not create physical pages.
+// tmo_vmm_commit maps those pages after the planned capture, so the graph is
+// recorded against stable virtual addresses and the physical footprint is the
+// packed span rather than the first-fit high water. Reservations are tracked
+// here because cudaFree cannot release a cuMemAddressReserve pointer.
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+struct TmoVmmAlloc {
+  size_t reserved{0};
+  int device{0};
+  bool mapped{false};
+  CUmemGenericAllocationHandle handle{0};
+};
+
+struct TmoVmmState {
+  std::mutex mu;
+  std::atomic<bool> va_only{false};
+  std::unordered_map<void*, TmoVmmAlloc> live;
+  size_t physical_bytes{0};
+  size_t granularity{0};
+};
+
+TmoVmmState& tmo_vmm() {
+  static TmoVmmState state;
+  return state;
+}
+
+bool tmo_va_only_enabled() {
+  return tmo_vmm().va_only.load(std::memory_order_acquire);
+}
+
+size_t tmo_vmm_granularity(int device) {
+  auto& state = tmo_vmm();
+  if (state.granularity != 0) {
+    return state.granularity;
+  }
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  size_t gran = 0;
+  C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemGetAllocationGranularity_(
+      &gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  TORCH_CHECK(gran != 0, "tensor_memory_opt: CUDA VMM granularity is 0");
+  state.granularity = gran;
+  return gran;
+}
+
+cudaError_t tmo_vmm_reserve(void** ptr, size_t size, int device) {
+  auto& state = tmo_vmm();
+  std::lock_guard<std::mutex> guard(state.mu);
+  const size_t gran = tmo_vmm_granularity(device);
+  const size_t reserved = ((size + gran - 1) / gran) * gran;
+  CUdeviceptr addr = 0;
+  CUresult status = DriverAPI::get()->cuMemAddressReserve_(
+      &addr, reserved, gran, 0, 0ULL);
+  if (status != CUDA_SUCCESS || addr == 0) {
+    return cudaErrorMemoryAllocation;
+  }
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  void* base = reinterpret_cast<void*>(addr);
+  state.live.emplace(base, TmoVmmAlloc{reserved, device, false, 0});
+  *ptr = base;
+  return cudaSuccess;
+}
+
+void tmo_vmm_map_one(void* base, TmoVmmAlloc& alloc) {
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = alloc.device;
+  CUmemGenericAllocationHandle handle = 0;
+  C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemCreate_(
+      &handle, alloc.reserved, &prop, 0ULL));
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  CUdeviceptr addr = reinterpret_cast<CUdeviceptr>(base);
+  CUresult mapped = DriverAPI::get()->cuMemMap_(
+      addr, alloc.reserved, 0, handle, 0ULL);
+  if (mapped != CUDA_SUCCESS) {
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(handle));
+    C10_CUDA_DRIVER_CHECK(mapped);
+  }
+  CUmemAccessDesc desc = {};
+  desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  desc.location.id = alloc.device;
+  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  CUresult access = DriverAPI::get()->cuMemSetAccess_(
+      addr, alloc.reserved, &desc, 1ULL);
+  if (access != CUDA_SUCCESS) {
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemUnmap_(addr, alloc.reserved));
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(handle));
+    C10_CUDA_DRIVER_CHECK(access);
+  }
+  alloc.handle = handle;
+  alloc.mapped = true;
+}
+
+// Returns true when ptr was a VMM reservation and has been released.
+bool tmo_vmm_release_if_owned(void* ptr) {
+  auto& state = tmo_vmm();
+  std::lock_guard<std::mutex> guard(state.mu);
+  auto it = state.live.find(ptr);
+  if (it == state.live.end()) {
+    return false;
+  }
+  TmoVmmAlloc alloc = it->second;
+  state.live.erase(it);
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  CUdeviceptr addr = reinterpret_cast<CUdeviceptr>(ptr);
+  if (alloc.mapped) {
+    // cuMemUnmap does not synchronize the way cudaFree does. The graph pool
+    // drops a segment only after the graph that used it is gone; still wait
+    // so a replay cannot touch the pages as they are unmapped.
+    cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(alloc.device));
+    C10_CUDA_CHECK(cudaDeviceSynchronize());
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemUnmap_(addr, alloc.reserved));
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(alloc.handle));
+    state.physical_bytes -= alloc.reserved;
+  }
+  C10_CUDA_DRIVER_CHECK(
+      DriverAPI::get()->cuMemAddressFree_(addr, alloc.reserved));
+  return true;
+}
+
+void tmo_vmm_commit_impl() {
+  auto& state = tmo_vmm();
+  // Driver calls can re-enter the caching allocator. Do not hold either the
+  // VMM mutex or the allocator mutex across cuMemCreate / cuMemMap.
+  std::vector<void*> pending;
+  {
+    std::lock_guard<std::mutex> guard(state.mu);
+    pending.reserve(state.live.size());
+    for (const auto& entry : state.live) {
+      if (!entry.second.mapped) {
+        pending.push_back(entry.first);
+      }
+    }
+  }
+  for (void* base : pending) {
+    TmoVmmAlloc alloc;
+    {
+      std::lock_guard<std::mutex> guard(state.mu);
+      auto it = state.live.find(base);
+      if (it == state.live.end() || it->second.mapped) {
+        continue;
+      }
+      alloc = it->second;
+    }
+    tmo_vmm_map_one(base, alloc);
+    std::lock_guard<std::mutex> guard(state.mu);
+    auto it = state.live.find(base);
+    if (it == state.live.end() || it->second.mapped) {
+      if (alloc.mapped) {
+        // NOLINTNEXTLINE(performance-no-int-to-ptr)
+        CUdeviceptr addr = reinterpret_cast<CUdeviceptr>(base);
+        C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemUnmap_(addr, alloc.reserved));
+        C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(alloc.handle));
+      }
+      continue;
+    }
+    it->second.handle = alloc.handle;
+    it->second.mapped = true;
+    state.physical_bytes += alloc.reserved;
+  }
+}
+
+size_t tmo_vmm_physical_bytes_impl() {
+  auto& state = tmo_vmm();
+  std::lock_guard<std::mutex> guard(state.mu);
+  return state.physical_bytes;
+}
+
+void tmo_va_only_set(bool enabled) {
+  tmo_vmm().va_only.store(enabled, std::memory_order_release);
+}
+#else
+bool tmo_va_only_enabled() {
+  return false;
+}
+bool tmo_vmm_release_if_owned(void* /*ptr*/) {
+  return false;
+}
+void tmo_vmm_commit_impl() {}
+size_t tmo_vmm_physical_bytes_impl() {
+  return 0;
+}
+void tmo_va_only_set(bool /*enabled*/) {}
+#endif
+
 cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  // Only allocations made while the stream is actually capturing may be
+  // virtual. CUDAGraph::capture_begin runs the generator prologue, and that
+  // prologue launches a real kernel, before cudaStreamBeginCapture. A virtual
+  // address there faults. Kernel nodes recorded during capture are not
+  // executed, so an unmapped reservation is safe until tmo_vmm_commit.
+  if (tmo_va_only_enabled()) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cudaError_t info = cudaStreamGetCaptureInfo(p.stream(), &capture_status, nullptr);
+    if (info == cudaSuccess &&
+        capture_status == cudaStreamCaptureStatusActive) {
+      return tmo_vmm_reserve(ptr, size, static_cast<int>(p.device()));
+    }
+  }
+#endif
   if (p.pool->owner_PrivatePool && p.pool->owner_PrivatePool->allocator()) {
     *ptr = p.pool->owner_PrivatePool->allocator()->raw_alloc(size);
     return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
@@ -1167,6 +1371,49 @@ static std::atomic<int64_t> g_smg_reuse_count{0};
 
 namespace Native {
 
+// tensor_memory_opt plan. One capture at a time. The recording pass observes
+// alloc/free_completed; greedy-by-size assigns an offset to each alloc; the
+// second capture carves those offsets out of a single segment so the graph
+// pool's reserved bytes track the packed span instead of the online
+// first-fit high water.
+struct TmoPlanState {
+  std::mutex mu;
+  bool active{false};
+  bool arena_ready{false};
+  std::vector<size_t> sizes;
+  std::vector<size_t> offsets;
+  size_t cursor{0};
+  size_t arena_bytes{0};
+  void* arena_base{nullptr};
+};
+
+TmoPlanState& tmo_plan() {
+  static TmoPlanState state;
+  return state;
+}
+
+// Capture-only alloc/free log. The Python memory-history snapshot also
+// contains allocs on this stream from before cudaStreamBeginCapture (the
+// graph pool filter rejects those). Planning from that mix makes the second
+// capture disagree with the first malloc. This log uses the same filter the
+// allocator uses to divert a malloc into the private pool.
+struct TmoTraceEvent {
+  uint8_t action; // 1 = alloc, 2 = free_completed
+  uint64_t addr;
+  uint64_t size;
+};
+
+struct TmoTraceState {
+  std::mutex mu;
+  bool enabled{false};
+  std::vector<TmoTraceEvent> events;
+};
+
+TmoTraceState& tmo_trace() {
+  static TmoTraceState state;
+  return state;
+}
+
 class DeviceCachingAllocator {
  private:
   // lock around all operations
@@ -1340,6 +1587,240 @@ class DeviceCachingAllocator {
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
 
+  // Caller holds `mutex`. Splits `cover` so [addr, addr+size) becomes its own
+  // block and any leftovers stay on the free list, address-ordered via
+  // prev/next. `cover` must already have been removed from pool->blocks.
+  Block* carve_planned_block(BlockPool* pool, Block* cover, char* addr, size_t size) {
+    char* cover_begin = static_cast<char*>(cover->ptr);
+    char* cover_end = cover_begin + cover->size;
+    char* addr_end = addr + size;
+    TORCH_INTERNAL_ASSERT(cover_begin <= addr && addr_end <= cover_end);
+    const bool cover_was_split = cover->is_split();
+    const size_t cover_size = cover->size;
+
+    Block* prev = cover->prev;
+    Block* next = cover->next;
+    Block* left = nullptr;
+    Block* mid = nullptr;
+    Block* right = nullptr;
+
+    if (addr > cover_begin) {
+      left = cover;
+      left->size = static_cast<size_t>(addr - cover_begin);
+      mid = new Block(cover->device, cover->stream, size, pool, addr);
+      mid->expandable_segment_ = cover->expandable_segment_;
+    } else {
+      mid = cover;
+      mid->ptr = addr;
+      mid->size = size;
+    }
+    if (addr_end < cover_end) {
+      right = new Block(
+          cover->device,
+          cover->stream,
+          static_cast<size_t>(cover_end - addr_end),
+          pool,
+          addr_end);
+      right->expandable_segment_ = cover->expandable_segment_;
+    }
+
+    Block* chain = prev;
+    auto link = [&](Block* block) {
+      if (block == nullptr) {
+        return;
+      }
+      block->prev = chain;
+      if (chain != nullptr) {
+        chain->next = block;
+      }
+      chain = block;
+    };
+    link(left);
+    link(mid);
+    link(right);
+    if (chain != nullptr) {
+      chain->next = next;
+    }
+    if (next != nullptr) {
+      next->prev = chain;
+    }
+
+    if (left != nullptr) {
+      TORCH_INTERNAL_ASSERT(pool->insert_into_blocks(left).second);
+    }
+    if (right != nullptr) {
+      TORCH_INTERNAL_ASSERT(pool->insert_into_blocks(right).second);
+    }
+    // `cover` was already removed from the free set. An unsplit free segment
+    // is not an inactive split; a free hole between live blocks is. Replace
+    // that accounting with the leftovers, or a later merge decrements a stat
+    // that was never incremented.
+    int64_t split_blocks = 0;
+    int64_t split_bytes = 0;
+    if (cover_was_split) {
+      split_blocks -= 1;
+      split_bytes -= static_cast<int64_t>(cover_size);
+    }
+    if (left != nullptr) {
+      split_blocks += 1;
+      split_bytes += static_cast<int64_t>(left->size);
+    }
+    if (right != nullptr) {
+      split_blocks += 1;
+      split_bytes += static_cast<int64_t>(right->size);
+    }
+    StatTypes stat_types = get_stat_types_for_pool(*pool);
+    for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+      if (split_blocks > 0) {
+        stats.inactive_split[stat_type].increase(static_cast<size_t>(split_blocks));
+      } else if (split_blocks < 0) {
+        stats.inactive_split[stat_type].decrease(static_cast<size_t>(-split_blocks));
+      }
+      if (split_bytes > 0) {
+        stats.inactive_split_bytes[stat_type].increase(static_cast<size_t>(split_bytes));
+      } else if (split_bytes < 0) {
+        stats.inactive_split_bytes[stat_type].decrease(static_cast<size_t>(-split_bytes));
+      }
+    });
+    mid->allocated = false;
+    return mid;
+  }
+
+  // `mutex` is held by the caller. Returns nullptr when this allocation should
+  // take the normal caching-allocator path.
+  Block* try_tmo_malloc(
+      c10::DeviceIndex device,
+      size_t orig_size,
+      cudaStream_t stream,
+      const std::shared_ptr<GatheredContext>& context,
+      std::unique_lock<std::recursive_mutex>& lock) {
+    auto& plan = tmo_plan();
+    std::unique_lock<std::mutex> plan_lock(plan.mu);
+    if (!plan.active || captures_underway.empty()) {
+      return nullptr;
+    }
+    bool on_capture_stream = false;
+    for (auto& entry : captures_underway) {
+      if (entry.second(stream)) {
+        on_capture_stream = true;
+        break;
+      }
+    }
+    if (!on_capture_stream) {
+      return nullptr;
+    }
+    TORCH_CHECK(
+        plan.cursor < plan.sizes.size(),
+        "tensor_memory_opt: this capture allocated more blocks than the recording pass (",
+        plan.sizes.size(),
+        " planned, allocation ",
+        plan.cursor,
+        " has no entry)");
+    const size_t rounded = round_size(orig_size);
+    TORCH_CHECK(
+        rounded == plan.sizes[plan.cursor],
+        "tensor_memory_opt: allocation ",
+        plan.cursor,
+        " rounded to ",
+        rounded,
+        " bytes but the recording pass saw ",
+        plan.sizes[plan.cursor],
+        ". The second capture is not the same malloc sequence.");
+    const size_t offset = plan.offsets[plan.cursor];
+    const size_t arena_bytes = plan.arena_bytes;
+    const bool need_arena = !plan.arena_ready;
+    void* arena_base = plan.arena_base;
+    plan.cursor += 1;
+    if (need_arena) {
+      plan.arena_ready = true;
+    }
+    plan_lock.unlock();
+
+    if (need_arena) {
+      auto& pool = get_pool(arena_bytes, stream);
+      const size_t alloc_size = get_allocation_size(arena_bytes);
+      TORCH_CHECK(
+          alloc_size == arena_bytes,
+          "tensor_memory_opt: arena ",
+          arena_bytes,
+          " is not a stable segment size; the allocator would reserve ",
+          alloc_size);
+      AllocParams params(device, arena_bytes, stream, &pool, alloc_size);
+      params.stat_types = get_stat_types_for_pool(pool);
+      bool allocated = alloc_block(params, false, context, lock);
+      TORCH_CHECK(
+          allocated && params.block != nullptr,
+          "tensor_memory_opt: failed to reserve the packed arena (",
+          arena_bytes,
+          " bytes)");
+      TORCH_INTERNAL_ASSERT(pool.insert_into_blocks(params.block).second);
+      arena_base = params.block->ptr;
+      // The plan is already known. Map physical pages onto the reserved
+      // virtual arena before this malloc returns, so the kernels recorded
+      // later in this capture see a mapped address. PyTorch reductions and
+      // copies reject an unmapped VMM pointer even when a raw kernel launch
+      // would only record it. Drop the allocator lock first: cuMemMap can
+      // re-enter malloc.
+      {
+        auto relock = c10::make_scope_exit([&]() { lock.lock(); });
+        lock.unlock();
+        tmo_vmm_commit_impl();
+      }
+      std::lock_guard<std::mutex> guard(plan.mu);
+      plan.arena_base = arena_base;
+    }
+
+    TORCH_CHECK(arena_base != nullptr, "tensor_memory_opt: packed arena is missing");
+    auto& pool = get_pool(arena_bytes, stream);
+    char* want = static_cast<char*>(arena_base) + offset;
+    Block* cover = nullptr;
+    for (Block* block : pool.blocks) {
+      char* begin = static_cast<char*>(block->ptr);
+      if (begin <= want && want + rounded <= begin + block->size) {
+        cover = block;
+        break;
+      }
+    }
+    TORCH_CHECK(
+        cover != nullptr,
+        "tensor_memory_opt: offset ",
+        offset,
+        " size ",
+        rounded,
+        " is not inside a free span of the packed arena");
+    pool.blocks.erase(cover);
+    // The arena can be reused by a capture on another stream of the same stream mutex group
+    // (pdmux gives every Green Context stream group its own stream). Re-key the free span to
+    // the allocating stream, as get_free_block's stream-mutex-group fallback does; the left and
+    // right leftovers inherit it from `cover`.
+    cover->stream = stream;
+    Block* mid = carve_planned_block(&pool, cover, want, rounded);
+
+    // alloc_found_block treats a block with prev/next as an inactive split and
+    // decrements split stats we never incremented. Detach for that call, then
+    // restore the address-ordered links so a later free can merge.
+    Block* saved_prev = mid->prev;
+    Block* saved_next = mid->next;
+    mid->prev = nullptr;
+    mid->next = nullptr;
+
+    AllocParams params(device, rounded, stream, &pool, rounded);
+    params.stat_types = get_stat_types_for_pool(pool);
+    params.block = mid;
+    params.err = cudaSuccess;
+    Block* result =
+        alloc_found_block(params, orig_size, context, /*split_remainder=*/false);
+    result->prev = saved_prev;
+    result->next = saved_next;
+    if (saved_prev != nullptr) {
+      saved_prev->next = result;
+    }
+    if (saved_next != nullptr) {
+      saved_next->prev = result;
+    }
+    return result;
+  }
+
   Block* malloc(
       c10::DeviceIndex device,
       size_t orig_size,
@@ -1349,6 +1830,11 @@ class DeviceCachingAllocator {
     auto context = maybeGatherContext(RecordContext::STATE);
 
     std::unique_lock<std::recursive_mutex> lock(mutex);
+
+    if (Block* planned =
+            try_tmo_malloc(device, orig_size, stream, context, lock)) {
+      return planned;
+    }
 
     if (C10_LIKELY(captures_underway.empty())) {
       // Processes end-of-life events for outstanding allocations used on
@@ -3393,7 +3879,9 @@ class DeviceCachingAllocator {
         context ? context : block->context_when_segment_allocated);
 
     auto* pool = block->pool;
-    if (pool->owner_PrivatePool && pool->owner_PrivatePool->allocator()) {
+    if (tmo_vmm_release_if_owned(block->ptr)) {
+      // Virtual reservation (and any physical pages mapped onto it) is gone.
+    } else if (pool->owner_PrivatePool && pool->owner_PrivatePool->allocator()) {
       // If there is an active mempool with a given allocator,
       // we use the given allocator's delete function.
       pool->owner_PrivatePool->allocator()->raw_delete((void*)block->ptr);
@@ -3682,6 +4170,35 @@ class DeviceCachingAllocator {
     }
   }
 
+  void note_tmo_trace(
+      TraceEntry::Action action,
+      size_t addr,
+      size_t size,
+      cudaStream_t stream) {
+    auto& trace = tmo_trace();
+    if (!trace.enabled) {
+      return;
+    }
+    if (action != TraceEntry::ALLOC && action != TraceEntry::FREE_COMPLETED) {
+      return;
+    }
+    bool on_capture_stream = false;
+    for (auto& entry : captures_underway) {
+      if (entry.second(stream)) {
+        on_capture_stream = true;
+        break;
+      }
+    }
+    if (!on_capture_stream) {
+      return;
+    }
+    std::lock_guard<std::mutex> guard(trace.mu);
+    trace.events.push_back(TmoTraceEvent{
+        static_cast<uint8_t>(action == TraceEntry::ALLOC ? 1 : 2),
+        static_cast<uint64_t>(addr),
+        static_cast<uint64_t>(size)});
+  }
+
   void record_trace(
       TraceEntry::Action action,
       size_t addr,
@@ -3690,6 +4207,7 @@ class DeviceCachingAllocator {
       c10::DeviceIndex device,
       MempoolId_t mempool_id,
       std::shared_ptr<GatheredContext> context) {
+    note_tmo_trace(action, addr, size, stream);
     if (!record_history && trace_trackers_.empty())
       return;
     std::string compile_string = "N/A";
@@ -4416,6 +4934,110 @@ class NativeCachingAllocator : public CUDAAllocator {
         cudaMemcpy(dest, src, count, cudaMemcpyKind::cudaMemcpyDeviceToDevice));
   }
 };
+
+extern "C" {
+
+__attribute__((visibility("default"))) void tmo_set_capture_plan(
+    const size_t* sizes,
+    const size_t* offsets,
+    size_t n,
+    size_t arena_bytes) {
+  auto& plan = tmo_plan();
+  std::lock_guard<std::mutex> guard(plan.mu);
+  plan.sizes.assign(sizes, sizes + n);
+  plan.offsets.assign(offsets, offsets + n);
+  plan.cursor = 0;
+  plan.arena_bytes = arena_bytes;
+  plan.arena_ready = false;
+  plan.arena_base = nullptr;
+  plan.active = n > 0 && arena_bytes > 0;
+}
+
+// Plan inside an arena that an earlier capture already reserved (same private pool): no new
+// segment is created, the planned offsets are carved from the free spans at `base`.
+__attribute__((visibility("default"))) void tmo_set_capture_plan_at(
+    const size_t* sizes,
+    const size_t* offsets,
+    size_t n,
+    size_t arena_bytes,
+    void* base) {
+  tmo_set_capture_plan(sizes, offsets, n, arena_bytes);
+  auto& plan = tmo_plan();
+  std::lock_guard<std::mutex> guard(plan.mu);
+  plan.arena_ready = base != nullptr;
+  plan.arena_base = base;
+}
+
+// Base address of the arena of the most recent plan (nullptr before the first allocation).
+__attribute__((visibility("default"))) void* tmo_capture_plan_arena_base() {
+  auto& plan = tmo_plan();
+  std::lock_guard<std::mutex> guard(plan.mu);
+  return plan.arena_base;
+}
+
+__attribute__((visibility("default"))) void tmo_clear_capture_plan() {
+  auto& plan = tmo_plan();
+  std::lock_guard<std::mutex> guard(plan.mu);
+  plan.active = false;
+}
+
+__attribute__((visibility("default"))) size_t tmo_capture_plan_cursor() {
+  auto& plan = tmo_plan();
+  std::lock_guard<std::mutex> guard(plan.mu);
+  return plan.cursor;
+}
+
+__attribute__((visibility("default"))) void tmo_trace_begin() {
+  auto& trace = tmo_trace();
+  std::lock_guard<std::mutex> guard(trace.mu);
+  trace.events.clear();
+  trace.enabled = true;
+}
+
+__attribute__((visibility("default"))) void tmo_trace_end() {
+  auto& trace = tmo_trace();
+  std::lock_guard<std::mutex> guard(trace.mu);
+  trace.enabled = false;
+}
+
+__attribute__((visibility("default"))) size_t tmo_trace_count() {
+  auto& trace = tmo_trace();
+  std::lock_guard<std::mutex> guard(trace.mu);
+  return trace.events.size();
+}
+
+__attribute__((visibility("default"))) void tmo_va_only_begin() {
+  tmo_va_only_set(true);
+}
+
+__attribute__((visibility("default"))) void tmo_va_only_end() {
+  tmo_va_only_set(false);
+}
+
+__attribute__((visibility("default"))) void tmo_vmm_commit() {
+  tmo_vmm_commit_impl();
+}
+
+__attribute__((visibility("default"))) size_t tmo_vmm_physical_bytes() {
+  return tmo_vmm_physical_bytes_impl();
+}
+
+__attribute__((visibility("default"))) void tmo_copy_trace(
+    uint8_t* actions,
+    uint64_t* addrs,
+    uint64_t* sizes,
+    size_t n) {
+  auto& trace = tmo_trace();
+  std::lock_guard<std::mutex> guard(trace.mu);
+  size_t count = std::min(n, trace.events.size());
+  for (size_t i = 0; i < count; ++i) {
+    actions[i] = trace.events[i].action;
+    addrs[i] = trace.events[i].addr;
+    sizes[i] = trace.events[i].size;
+  }
+}
+
+} // extern "C"
 
 static NativeCachingAllocator allocator;
 
