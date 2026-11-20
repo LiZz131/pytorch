@@ -1,0 +1,164 @@
+commit f9c075b9b5b1a0e4e077e5dfb8f7bcdc2df1bb18
+Author: bzli <bzli@local>
+Date:   Mon Oct 26 05:47:21 2026 +0000
+
+    feat(cgmo): merge CUDA graph memory optimization into the share-prefix tree
+    
+    Pack graph intermediates into one arena and fold repeated decoder layers so a DeepSeek-V3.1 pdmux capture drops from 10.2 GB to 3.3 GB per GPU. The tool stays off unless CGMO is set, and the oar_done share-prefix path is unchanged.
+
+diff --git a/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py b/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
+index 0d5f612ce..14a446fcf 100644
+--- a/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
++++ b/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
+@@ -27,6 +27,12 @@ _is_hip = is_hip()
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _cgmo_uses_vmm_arena() -> bool:
++    from sglang.srt.model_executor.cgmo_hook import uses_vmm_arena
++
++    return uses_vmm_arena()
++
++
+ def _can_p2p(rank: int, world_size: int) -> bool:
+     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
+     SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
+@@ -198,6 +204,18 @@ class CustomAllreduce:
+ 
+         self.disabled = False
+         self.original_disabled = False  # Ensure original_disabled == disabled
++        # cuda_graph_memopt (tensor feature with a VMM arena): graph tensors then live at
++        # cuMemMap addresses. cudaIpcGetMemHandle rejects them; torch-memory-saver hits the
++        # same driver limit (https://github.com/fzyzcjy/torch_memory_saver/issues/36).
++        # SGLang's memory-saver CUDA-graph mode copies the activation into the cudaMalloc IPC
++        # scratch during capture (all_reduce in custom_all_reduce.cu when _reg_buffer is set),
++        # so get_graph_buffer_ipc_meta exports that scratch, not the arena.
++        if not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.is_set() and _cgmo_uses_vmm_arena():
++            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
++            logger.info(
++                "cuda_graph_memopt VMM arena: custom allreduce uses the unregistered "
++                "CUDA-graph path so IPC handles stay on the cudaMalloc scratch."
++            )
+         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+ 
+     @staticmethod
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index a9645612e..0ff9cbe2a 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -243,6 +243,7 @@ class CudaGraphRunner:
+         self.device_module = torch.get_device_module(self.device)
+         self.graphs = {}
+         self.output_buffers = {}
++        self.cgmo = self._create_graph_memopt()
+         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+@@ -552,6 +553,12 @@ class CudaGraphRunner:
+                         self.stream = graph_capture_context.stream
+                         _capture_one_stream(i)
+ 
++        if self.cgmo is not None:
++            # Fold checks replay graphs, which is illegal inside graph_capture() (custom
++            # all-reduce registers the graph buffers when that context exits).
++            self.cgmo.verify_pending()
++            self.cgmo.finish()
++
+         if self.enable_profile_cuda_graph:
+             self._post_process_after_profile(prof)
+ 
+@@ -581,18 +588,54 @@ class CudaGraphRunner:
+             if memory_saver_adapter.enabled
+             else self.device_module.graph
+         )
++        if self.cgmo is not None:
++            return self.cgmo.capture(
++                graph,
++                pool,
++                stream,
++                run_once_fn,
++                key=self._cgmo_key,
++                group=self._cgmo_group,
++                graph_ctx=graph_fn if memory_saver_adapter.enabled else None,
++            )
+         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
+             out = run_once_fn()
+         return out
+ 
+     def _create_device_graph(self):
++        if self.cgmo is not None:
++            return self.cgmo.new_graph()
+         return torch.cuda.CUDAGraph()
+ 
++    def _create_graph_memopt(self):
++        """cuda_graph_memopt manager (env CGMO), only for the plain CUDA runner.
++
++        Runners that override capture/replay (NPU, EAGLE draft, ...) keep stock behaviour: a
++        folded graph has no unrolled executable, so every replay site has to go through the manager.
++        """
++        self._cgmo_key = None
++        self._cgmo_group = None
++        from sglang.srt.model_executor.cgmo_hook import cgmo_requested, create_graph_memopt
++
++        if not cgmo_requested():
++            return None
++        cls = type(self)
++        plain = all(
++            getattr(cls, name) is getattr(CudaGraphRunner, name)
++            for name in ("_capture_graph", "_create_device_graph", "capture_one_batch_size", "replay")
++        )
++        if not plain or not str(self.device).startswith("cuda"):
++            logger.warning("CGMO is set but %s does not use the stock CUDA graph path; disabled", cls.__name__)
++            return None
++        return create_graph_memopt()
++
+     def capture_one_batch_size(
+         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+     ):
+         buffers: GraphInputBuffers = self.buffers
+         graph = self._create_device_graph()
++        self._cgmo_key = bs if stream_idx is None else f"{stream_idx}_{bs}"
++        self._cgmo_group = stream_idx
+         stream = self.stream
+         num_tokens = bs * self.num_tokens_per_bs
+ 
+@@ -901,7 +944,10 @@ class CudaGraphRunner:
+         else:
+             graph_key = self.bs
+ 
+-        self.graphs[graph_key].replay()
++        if self.cgmo is not None:
++            self.cgmo.replay(graph_key, self.graphs[graph_key])
++        else:
++            self.graphs[graph_key].replay()
+         output = self.output_buffers[graph_key]
+ 
+         if isinstance(output, LogitsProcessorOutput):
+diff --git a/test_scripts/perf/start_server_pdmux_special_dpa.sh b/test_scripts/perf/start_server_pdmux_special_dpa.sh
+index 92977cbbe..3e63bb0cc 100755
+--- a/test_scripts/perf/start_server_pdmux_special_dpa.sh
++++ b/test_scripts/perf/start_server_pdmux_special_dpa.sh
+@@ -18,6 +18,11 @@
+ # chunked-prefill：CLI 传 524288，DPA 会除以 dp_size=8，生效值 65536。
+ # predictor：bench_out/pdmux_fit_full/pdmux_fitted.yaml
+ # overlap-schedule：关闭（pdmux 要求；对照 DPA 同样关闭）。
++#
++# cuda_graph_memopt（CUDA graph 显存优化）：设 CGMO=tensor,fold（或 tensor / fold / all）开启。
++#   native 库先用 bash cuda_graph_memopt/build.sh all 编出来（或使用已带库的镜像）。
++#   libc10_cuda.so 必须在 python 启动前由 LD_LIBRARY_PATH 找到，本脚本在 CGMO 非空时自动设置。
++#   CGMO 未设置时不介入，也不修改 LD_LIBRARY_PATH。详见 cuda_graph_memopt/README.md。
+ # =============================================================================
+ 
+ set -Eeuo pipefail
+@@ -26,6 +31,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ source "${SCRIPT_DIR}/common.sh"
+ 
+ ensure_sglang_link
++if [[ -n "${CGMO:-}" ]]; then
++  _cgmo_lib="${CGMO_LIB_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)/cuda_graph_memopt/lib}"
++  test -f "${_cgmo_lib}/libc10_cuda.so" || { echo "CGMO=${CGMO} but ${_cgmo_lib}/libc10_cuda.so is missing (bash cuda_graph_memopt/build.sh all)" >&2; exit 1; }
++  export LD_LIBRARY_PATH="${_cgmo_lib}:${LD_LIBRARY_PATH:-}"
++fi
+ test -f "${FITTED_YAML}"
+ test -f "${PDMUX_CONFIG}"
+ cd "${SGLANG_LINK}"
