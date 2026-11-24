@@ -546,6 +546,18 @@ C10_CUDA_API void registerStreamMutexGroup(
     const std::vector<cudaStream_t>& streams,
     const std::string& key);
 
+// expandable = true: the group's allocations (outside CUDA graph private
+// pools) additionally share one expandable segment keyed by streams[0],
+// whatever the global expandable_segments setting is. Freed pages can be
+// unmapped / remapped, so differently sized large allocations across rounds
+// cannot fragment physical memory. Unmapping waits for every member stream.
+C10_CUDA_API void registerStreamMutexGroup(
+    const std::vector<cudaStream_t>& streams,
+    const std::string& key,
+    bool expandable);
+
+C10_CUDA_API bool streamMutexGroupIsExpandable(const std::string& key);
+
 C10_CUDA_API void unregisterStreamMutexGroup(const std::string& key);
 
 // Returns the total number of cross-stream block reuses since process start.

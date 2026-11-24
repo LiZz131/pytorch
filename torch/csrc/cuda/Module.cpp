@@ -1130,13 +1130,20 @@ static void registerCudaDeviceProperties(PyObject* module) {
   // streams to eliminate N× memory growth in pdmux scenarios.
   m.def(
       "_cuda_registerStreamMutexGroup",
-      [](std::vector<int64_t> raw_streams, std::string key) {
+      [](std::vector<int64_t> raw_streams, std::string key, bool expandable) {
         std::vector<cudaStream_t> streams;
         streams.reserve(raw_streams.size());
         for (auto s : raw_streams)
           streams.push_back(reinterpret_cast<cudaStream_t>(s));
-        c10::cuda::CUDACachingAllocator::registerStreamMutexGroup(streams, key);
-      });
+        c10::cuda::CUDACachingAllocator::registerStreamMutexGroup(
+            streams, key, expandable);
+      },
+      py::arg("streams"),
+      py::arg("key"),
+      py::arg("expandable") = false);
+  m.def("_cuda_streamMutexGroupIsExpandable", [](std::string key) {
+    return c10::cuda::CUDACachingAllocator::streamMutexGroupIsExpandable(key);
+  });
   m.def("_cuda_unregisterStreamMutexGroup", [](std::string key) {
     c10::cuda::CUDACachingAllocator::unregisterStreamMutexGroup(key);
   });

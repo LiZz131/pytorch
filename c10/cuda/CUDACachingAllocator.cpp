@@ -370,6 +370,9 @@ Instead these mapping have to be done manually. The allocator now has an
 `enablePeerAccess` method to do this.
 */
 
+// Defined after the stream mutex group registry (below).
+bool smg_group_streams(int gid, std::vector<cudaStream_t>& out);
+
 struct ExpandableSegment {
   ExpandableSegment(
       c10::DeviceIndex device,
@@ -624,6 +627,16 @@ struct ExpandableSegment {
     return max_handles_ * segment_size_;
   }
 
+  // Stream mutex group that shares this segment (-1: owned by stream_ only).
+  // Pages freed by any member stream may still be in use by that stream's
+  // queued work, so unmapping must wait for every member.
+  void set_smg_gid(int gid) {
+    smg_gid_ = gid;
+  }
+  int smg_gid() const {
+    return smg_gid_;
+  }
+
   void addPeer(c10::DeviceIndex device) {
     peers_.push_back(device);
     forEachAllocatedRange(
@@ -672,9 +685,16 @@ struct ExpandableSegment {
     // cannot call c10::cuda::stream_synchronize because
     // it might grab the GIL which can lead to a deadlock
     // Locking order must be GIL -> Allocator Lock
-    if (stream_) {
+    std::vector<cudaStream_t> group;
+    if (smg_gid_ >= 0 && smg_group_streams(smg_gid_, group)) {
+      // segment shared by a stream mutex group: wait for every member
+      for (auto s : group) {
+        C10_CUDA_CHECK(cudaStreamSynchronize(s));
+      }
+    } else if (stream_ && smg_gid_ < 0) {
       C10_CUDA_CHECK(cudaStreamSynchronize(*stream_));
     } else {
+      // no stream, or the sharing group was unregistered: be conservative
       cuda::CUDAGuard device_guard(device_);
       C10_CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -724,6 +744,7 @@ struct ExpandableSegment {
   }
   c10::DeviceIndex device_;
   std::optional<cudaStream_t> stream_;
+  int smg_gid_{-1};
   CUdeviceptr ptr_{};
   size_t segment_size_;
   size_t max_handles_;
@@ -770,6 +791,10 @@ struct ExpandableSegment {
   }
   size_t size() const {
     return 0;
+  }
+  void set_smg_gid(int gid) {}
+  int smg_gid() const {
+    return -1;
   }
   void addPeer(c10::DeviceIndex device) {}
 };
@@ -856,6 +881,12 @@ struct AllocParams {
   Block* block{nullptr};
   StatTypes stat_types = {false};
   cudaError_t err{cudaSuccess};
+  // Stream mutex group with a shared expandable segment: stream() is then the
+  // group's leader stream and new memory comes from that group's segment.
+  int smg_gid{-1};
+  bool smg_expandable() const {
+    return smg_gid >= 0;
+  }
 };
 
 // Note: cudaEventCreate when concurrently invoked from multiple threads can be
@@ -1153,12 +1184,17 @@ struct StreamMutexGroupRegistry {
   std::unordered_map<int, std::vector<cudaStream_t>> gid_to_streams;
   // registration key → group id (for unregister)
   std::unordered_map<std::string, int> key_to_gid;
+  // groups whose (non graph-pool) allocations use one shared expandable
+  // segment keyed by the group's leader stream (gid_to_streams[gid][0])
+  std::unordered_set<int> expandable_gids;
   int next_gid_{0};
 };
 
 static StreamMutexGroupRegistry g_smg_registry;
 // Fast early-exit: one atomic load ≈ 1 cycle when no groups registered.
 static std::atomic<bool> g_has_smg{false};
+// Fast early-exit for the expandable-group path (off unless a group asked).
+static std::atomic<bool> g_has_smg_expandable{false};
 // Diagnostic: total cross-stream block reuses via mutex groups.
 static std::atomic<int64_t> g_smg_reuse_count{0};
 
@@ -1166,6 +1202,39 @@ static std::atomic<int64_t> g_smg_reuse_count{0};
 // -----------------------------------------------------------------
 
 namespace Native {
+
+// If `stream` belongs to an expandable mutex group, returns true and sets the
+// group's leader stream and id. Takes the registry read lock (lock order:
+// allocator mutex -> registry, same as get_free_block).
+static bool smg_expandable_leader(
+    cudaStream_t stream,
+    cudaStream_t* leader,
+    int* gid) {
+  if (C10_LIKELY(!g_has_smg_expandable.load(std::memory_order_acquire))) {
+    return false;
+  }
+  std::shared_lock<std::shared_mutex> reg_lock(g_smg_registry.mu);
+  auto it = g_smg_registry.stream_to_gid.find(stream);
+  if (it == g_smg_registry.stream_to_gid.end() ||
+      !g_smg_registry.expandable_gids.count(it->second)) {
+    return false;
+  }
+  const auto& streams = g_smg_registry.gid_to_streams.at(it->second);
+  *leader = streams.front();
+  *gid = it->second;
+  return true;
+}
+
+// Current member streams of group `gid` (empty if it was unregistered).
+bool smg_group_streams(int gid, std::vector<cudaStream_t>& out) {
+  std::shared_lock<std::shared_mutex> reg_lock(g_smg_registry.mu);
+  auto it = g_smg_registry.gid_to_streams.find(gid);
+  if (it == g_smg_registry.gid_to_streams.end()) {
+    return false;
+  }
+  out = it->second;
+  return true;
+}
 
 class DeviceCachingAllocator {
  private:
@@ -1371,7 +1440,20 @@ class DeviceCachingAllocator {
     size_t size = round_size(orig_size);
     auto& pool = get_pool(size, stream);
     const size_t alloc_size = get_allocation_size(size);
+    // Stream mutex group with a shared expandable segment: key the request by
+    // the group's leader stream so every member searches, splits and frees in
+    // one bucket and grows one segment. Never for graph private pools (their
+    // pool was chosen above from the real, possibly capturing, stream).
+    int smg_gid = -1;
+    if (C10_UNLIKELY(g_has_smg_expandable.load(std::memory_order_acquire)) &&
+        !pool.owner_PrivatePool) {
+      cudaStream_t leader = nullptr;
+      if (smg_expandable_leader(stream, &leader, &smg_gid)) {
+        stream = leader;
+      }
+    }
     AllocParams params(device, size, stream, &pool, alloc_size);
+    params.smg_gid = smg_gid;
     params.stat_types = get_stat_types_for_pool(pool);
 
     // First, try to get a block from the existing pool.
@@ -2674,7 +2756,8 @@ class DeviceCachingAllocator {
       c10::DeviceIndex device,
       cudaStream_t stream,
       BlockPool* pool,
-      size_t size) {
+      size_t size,
+      int smg_gid = -1) {
     Block key(device, stream, 0);
 
     auto allocatable = [](Block* b) {
@@ -2708,6 +2791,9 @@ class DeviceCachingAllocator {
         device, stream, segment_size, devices_with_peer_access_));
 
     ExpandableSegment* es = expandable_segments_.back();
+    // stream is the group's leader for a mutex-group segment: unmapping must
+    // then wait for every member stream
+    es->set_smg_gid(smg_gid);
     Block* candidate = new Block(device, stream, es->size(), pool, es->ptr());
     candidate->mapped = false;
     candidate->expandable_segment_ = es;
@@ -2789,8 +2875,10 @@ class DeviceCachingAllocator {
       cudaStream_t stream,
       BlockPool* pool,
       size_t size,
-      const std::shared_ptr<GatheredContext>& ctx) {
-    Block* candidate = find_expandable_block(device, stream, pool, size);
+      const std::shared_ptr<GatheredContext>& ctx,
+      int smg_gid = -1) {
+    Block* candidate =
+        find_expandable_block(device, stream, pool, size, smg_gid);
     // Candidate is now a list free/unmapped blocks with at least size room:
     // unmapped -> null
     // unmapped -> free -> *
@@ -2964,7 +3052,8 @@ class DeviceCachingAllocator {
 
   bool should_split(const Block* block, size_t size) {
     size_t remaining = block->size - size;
-    if (block->pool->is_small || CUDAAllocatorConfig::expandable_segments()) {
+    if (block->pool->is_small || CUDAAllocatorConfig::expandable_segments() ||
+        block->expandable_segment_) {
       return remaining >= kMinBlockSize;
     } else {
       return (size < CUDAAllocatorConfig::max_split_size()) &&
@@ -3003,7 +3092,8 @@ class DeviceCachingAllocator {
         return pool.blocks.end();
 
       if ((*it)->expandable_segment_) {
-        if (CUDAAllocatorConfig::expandable_segments()) {
+        if (CUDAAllocatorConfig::expandable_segments() ||
+            p.smg_expandable()) {
           // For expandable segments, "best fit" uses the size the block can
           // expand to, not its current size. Scan forward for a better fit.
           auto expandable_size = [](Block* b) {
@@ -3180,13 +3270,13 @@ class DeviceCachingAllocator {
       return false;
       // Temporarily disable checkpointing & cudagraphs internally
     } else if (
-        CUDAAllocatorConfig::expandable_segments() &&
+        (CUDAAllocatorConfig::expandable_segments() || p.smg_expandable()) &&
         !(in_fbcode && p.pool->owner_PrivatePool)) {
       TORCH_CHECK(
           !active_pool,
           "torch.cuda.MemPool doesn't currently support expandable_segments.");
       p.block = try_allocate_expandable_block(
-          p.device(), p.stream(), p.pool, p.size(), ctx);
+          p.device(), p.stream(), p.pool, p.size(), ctx, p.smg_gid);
       if (p.block) {
         p.err = cudaSuccess;
         if (p.pool->owner_PrivatePool) {
@@ -4440,19 +4530,62 @@ void local_raw_delete(void* ptr) {
 //
 // Typical use: pdmux decode streams, pdmux prefill streams.
 // ============================================================
+namespace {
+// caller holds g_smg_registry.mu exclusively
+void smg_erase_group_locked(int gid) {
+  for (auto s : g_smg_registry.gid_to_streams[gid])
+    g_smg_registry.stream_to_gid.erase(s);
+  g_smg_registry.gid_to_streams.erase(gid);
+  g_smg_registry.expandable_gids.erase(gid);
+}
+void smg_update_flags_locked() {
+  g_has_smg.store(
+      !g_smg_registry.stream_to_gid.empty(), std::memory_order_release);
+  g_has_smg_expandable.store(
+      !g_smg_registry.expandable_gids.empty(), std::memory_order_release);
+}
+} // namespace
+
 void registerStreamMutexGroup(
     const std::vector<cudaStream_t>& streams,
     const std::string& key) {
+  registerStreamMutexGroup(streams, key, /*expandable=*/false);
+}
+
+// expandable: the group's (non graph-pool) allocations share one expandable
+// segment keyed by streams[0], independent of the global
+// expandable_segments setting. Freed pages can then be unmapped and remapped
+// instead of fragmenting physical memory across differently sized blocks.
+void registerStreamMutexGroup(
+    const std::vector<cudaStream_t>& streams,
+    const std::string& key,
+    bool expandable) {
+  TORCH_CHECK(!streams.empty(), "stream mutex group '", key, "' is empty");
   {
     std::unique_lock<std::shared_mutex> lock(g_smg_registry.mu);
     // Re-registration: clean up the old group first.
     auto key_it = g_smg_registry.key_to_gid.find(key);
     if (key_it != g_smg_registry.key_to_gid.end()) {
-      int old_gid = key_it->second;
-      for (auto s : g_smg_registry.gid_to_streams[old_gid])
-        g_smg_registry.stream_to_gid.erase(s);
-      g_smg_registry.gid_to_streams.erase(old_gid);
+      smg_erase_group_locked(key_it->second);
       g_smg_registry.key_to_gid.erase(key_it);
+    }
+    for (auto s : streams) {
+      auto other = g_smg_registry.stream_to_gid.find(s);
+      if (other != g_smg_registry.stream_to_gid.end()) {
+        // unchanged behaviour: the stream moves to the new group. Also drop it
+        // from the old group's member list so that group never keeps a leader
+        // stream that now belongs elsewhere.
+        LOG(WARNING) << "[StreamMutexGroup] stream already in another group;"
+                     << " moving it to '" << key << "'.";
+        auto& members = g_smg_registry.gid_to_streams[other->second];
+        members.erase(
+            std::remove(members.begin(), members.end(), s), members.end());
+        if (members.empty()) {
+          g_smg_registry.gid_to_streams.erase(other->second);
+          g_smg_registry.expandable_gids.erase(other->second);
+        }
+        g_smg_registry.stream_to_gid.erase(other);
+      }
     }
     int gid = g_smg_registry.next_gid_++;
     g_smg_registry.key_to_gid[key] = gid;
@@ -4460,10 +4593,13 @@ void registerStreamMutexGroup(
         std::vector<cudaStream_t>(streams.begin(), streams.end());
     for (auto s : streams)
       g_smg_registry.stream_to_gid[s] = gid;
-    g_has_smg.store(true, std::memory_order_release);
+    if (expandable)
+      g_smg_registry.expandable_gids.insert(gid);
+    smg_update_flags_locked();
   }
   LOG(INFO) << "[StreamMutexGroup] Registered group '" << key << "' with "
-            << streams.size() << " streams.";
+            << streams.size() << " streams"
+            << (expandable ? " (shared expandable segment)." : ".");
 }
 
 void unregisterStreamMutexGroup(const std::string& key) {
@@ -4472,15 +4608,18 @@ void unregisterStreamMutexGroup(const std::string& key) {
     auto key_it = g_smg_registry.key_to_gid.find(key);
     if (key_it == g_smg_registry.key_to_gid.end())
       return;
-    int gid = key_it->second;
-    for (auto s : g_smg_registry.gid_to_streams[gid])
-      g_smg_registry.stream_to_gid.erase(s);
-    g_smg_registry.gid_to_streams.erase(gid);
+    smg_erase_group_locked(key_it->second);
     g_smg_registry.key_to_gid.erase(key_it);
-    if (g_smg_registry.stream_to_gid.empty())
-      g_has_smg.store(false, std::memory_order_release);
+    smg_update_flags_locked();
   }
   LOG(INFO) << "[StreamMutexGroup] Unregistered group '" << key << "'.";
+}
+
+bool streamMutexGroupIsExpandable(const std::string& key) {
+  std::shared_lock<std::shared_mutex> lock(g_smg_registry.mu);
+  auto key_it = g_smg_registry.key_to_gid.find(key);
+  return key_it != g_smg_registry.key_to_gid.end() &&
+      g_smg_registry.expandable_gids.count(key_it->second);
 }
 
 int64_t streamMutexGroupReuseCount() {
