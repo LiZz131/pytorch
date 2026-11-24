@@ -1226,6 +1226,10 @@ static bool smg_expandable_leader(
 }
 
 // Current member streams of group `gid` (empty if it was unregistered).
+// Defined in Native's unnamed namespace: ExpandableSegment (above, inside that
+// namespace) declares it there, and all unnamed namespaces of Native in this
+// translation unit are the same namespace.
+namespace {
 bool smg_group_streams(int gid, std::vector<cudaStream_t>& out) {
   std::shared_lock<std::shared_mutex> reg_lock(g_smg_registry.mu);
   auto it = g_smg_registry.gid_to_streams.find(gid);
@@ -1235,6 +1239,7 @@ bool smg_group_streams(int gid, std::vector<cudaStream_t>& out) {
   out = it->second;
   return true;
 }
+} // namespace
 
 class DeviceCachingAllocator {
  private:
